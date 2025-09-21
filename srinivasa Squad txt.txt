@@ -1,0 +1,492 @@
+import cv2
+import numpy as np
+from PIL import Image
+import io
+import json
+from typing import List, Tuple, Dict, Any
+
+def read_image_bytes(file_bytes: bytes) -> np.ndarray:
+    arr = np.frombuffer(file_bytes, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return img
+
+def gray_resize(img: np.ndarray, max_dim=1200) -> np.ndarray:
+    h, w = img.shape[:2]
+    if max(h, w) > max_dim:
+        scale = max_dim / float(max(h, w))
+        img = cv2.resize(img, (int(w*scale), int(h*scale)))
+    return img
+
+def find_sheet_corners(img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Attempts to find the largest 4-point contour (sheet).
+    Returns (warped, M_inv) where warped is top-down image.
+    """
+    orig = img.copy()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blr = cv2.GaussianBlur(gray, (5,5), 0)
+    edged = cv2.Canny(blr, 50, 150)
+    contours, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+    sheet_cnt = None
+    for cnt in contours:
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) == 4:
+            sheet_cnt = approx
+            break
+    if sheet_cnt is None:
+        # fallback to image corners (no detection)
+        h,w = img.shape[:2]
+        sheet_cnt = np.array([[[0,0]], [[w-1,0]], [[w-1,h-1]], [[0,h-1]]])
+    pts = sheet_cnt.reshape(4,2)
+    # order points (tl, tr, br, bl)
+    rect = order_points(pts)
+    (tl, tr, br, bl) = rect
+    widthA = np.linalg.norm(br - bl)
+    widthB = np.linalg.norm(tr - tl)
+    maxWidth = int(max(widthA, widthB))
+    heightA = np.linalg.norm(tr - br)
+    heightB = np.linalg.norm(tl - bl)
+    maxHeight = int(max(heightA, heightB))
+    dst = np.array([
+        [0,0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]
+    ], dtype="float32")
+    M = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(orig, M, (maxWidth, maxHeight))
+    M_inv = cv2.getPerspectiveTransform(dst, rect)
+    return warped, M_inv
+
+def order_points(pts: np.ndarray) -> np.ndarray:
+    rect = np.zeros((4,2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+def enhance_contrast(img: np.ndarray) -> np.ndarray:
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl,a,b))
+    final = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    return final
+
+def threshold_for_bubbles(gray: np.ndarray) -> np.ndarray:
+    # adaptive threshold + morphological operations
+    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                               cv2.THRESH_BINARY_INV, 15, 8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
+    return th
+
+def detect_bubble_contours(thresh_img: np.ndarray, min_area=80, max_area=5000) -> List[np.ndarray]:
+    contours, _ = cv2.findContours(thresh_img.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    bubb_contours = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < min_area or area > max_area:
+            continue
+        x,y,w,h = cv2.boundingRect(c)
+        aspect = w/float(h)
+        if 0.5 <= aspect <= 1.6:
+            bubb_contours.append(c)
+    return bubb_contours
+
+def sort_contours_top_to_bottom(cnts: List[np.ndarray], method="top-to-bottom"):
+    # returns bounding boxes and contours sorted
+    boundingBoxes = [cv2.boundingRect(c) for c in cnts]
+    if method == "top-to-bottom":
+        zipped = sorted(zip(cnts, boundingBoxes), key=lambda b: b[1][1])
+    else:
+        zipped = sorted(zip(cnts, boundingBoxes), key=lambda b: b[1][0])
+    cnts, boxes = zip(*zipped) if zipped else ([], [])
+    return list(cnts), list(boxes)
+
+def cluster_into_grid(contours: List[np.ndarray], rows:int, cols:int) -> List[List[np.ndarray]]:
+    """
+    Very simple clustering assuming printed regular grid: sorts contours top-to-bottom,
+    then splits into rows by equal count.
+    """
+    if len(contours) < rows * cols:
+        # can't find expected number, but attempt to partition by row using vertical position
+        cnts_sorted, boxes = sort_contours_top_to_bottom(contours, method="top-to-bottom")
+        # split evenly
+        grid = []
+        per_row = max(1, len(cnts_sorted) // rows)
+        for r in range(rows):
+            start = r * per_row
+            end = start + per_row
+            grid.append(cnts_sorted[start:end])
+        return grid
+    # otherwise sort into rows by y coordinate
+    cnts_sorted, boxes = sort_contours_top_to_bottom(contours, method="top-to-bottom")
+    per_row = len(cnts_sorted)//rows
+    grid = []
+    for r in range(rows):
+        row_cnts = cnts_sorted[r*per_row:(r+1)*per_row]
+        # sort each row left-to-right
+        row_cnts_sorted, _ = sort_contours_top_to_bottom(row_cnts, method="left-to-right")
+        grid.append(row_cnts_sorted)
+    return grid
+
+def contour_center(c: np.ndarray) -> Tuple[int,int]:
+    M = cv2.moments(c)
+    if M["m00"] == 0:
+        return (0,0)
+    cx = int(M["m10"]/M["m00"])
+    cy = int(M["m01"]/M["m00"])
+    return (cx,cy)
+
+def measure_fill_ratio(cnt: np.ndarray, thresh_img: np.ndarray) -> float:
+    x,y,w,h = cv2.boundingRect(cnt)
+    roi = thresh_img[y:y+h, x:x+w]
+    if roi.size == 0:
+        return 0.0
+    filled = cv2.countNonZero(roi)
+    total = roi.size
+    return filled/total
+
+def classify_ambiguous(patch: np.ndarray) -> bool:
+    """
+    Placeholder for ML-based classification for ambiguous marks.
+    For now: simple heuristic on fill ratio (should be replaced).
+    """
+    # patch expected thresholded binary ROI
+    filled = cv2.countNonZero(patch)
+    total = patch.size
+    ratio = filled / (total + 1e-6)
+    return ratio > 0.25
+
+def evaluate_sheet(img: np.ndarray, version_key: Dict[str, Any], grid_spec: Dict[str,int]) -> Dict[str,Any]:
+    """
+    Main entry:
+      - img: BGR image (top-down ideally) or any orientation (we will attempt rectification before calling)
+      - version_key: dict mapping question number to correct option index (e.g., {"1":"B", ...})
+      - grid_spec: {"rows": 20, "cols_per_row": 5, "options": 4} etc.
+    Returns JSON with answers, scores, overlays.
+    """
+    proc = enhance_contrast(img)
+    gray = cv2.cvtColor(proc, cv2.COLOR_BGR2GRAY)
+    thresh = threshold_for_bubbles(gray)
+    bubble_contours = detect_bubble_contours(thresh)
+    # heuristics: expected number of bubbles:
+    expected = grid_spec["rows"] * grid_spec["cols_per_row"] * grid_spec.get("options", 4) // grid_spec.get("options",4)
+    # cluster into rows
+    rows = grid_spec["rows"]
+    cols = grid_spec["cols_per_row"] * grid_spec.get("options", 4) // grid_spec.get("options",4)
+    grid = cluster_into_grid(bubble_contours, rows, cols)
+    # now, for each row, assume options contiguous; this is template-specific.
+    answers = {}
+    overlays = img.copy()
+    qno = 1
+    total = 0
+    correct = 0
+    flagged = []
+    options = grid_spec.get("options", 4)
+    for r_idx, row in enumerate(grid):
+        # row may contain question bubbles (options*questions_in_row)
+        # For simplicity assume each question occupies options consecutive contours
+        # If row length not divisible by options, skip remainder
+        if len(row) < options: continue
+        for i in range(0, len(row), options):
+            group = row[i:i+options]
+            if len(group) < options:
+                continue
+            fills = []
+            for c in group:
+                ratio = measure_fill_ratio(c, thresh)
+                # get bounding box center
+                x,y,w,h = cv2.boundingRect(c)
+                roi = thresh[y:y+h, x:x+w]
+                is_filled = ratio > 0.35 or classify_ambiguous(roi)
+                fills.append((ratio, is_filled))
+            # find chosen option(s)
+            chosen = [idx for idx, (_, f) in enumerate(fills) if f]
+            if len(chosen) == 1:
+                chosen_opt = chr(ord('A') + chosen[0])
+            elif len(chosen) == 0:
+                chosen_opt = None
+            else:
+                chosen_opt = [chr(ord('A') + c) for c in chosen]
+            answers[str(qno)] = {
+                "chosen": chosen_opt,
+                "fill_ratios": [float(f[0]) for f in fills]
+            }
+            # draw overlay rectangles & text
+            for idx, c in enumerate(group):
+                x,y,w,h = cv2.boundingRect(c)
+                color = (0,255,0) if idx in chosen else (0,0,255)
+                cv2.rectangle(overlays, (x,y), (x+w, y+h), color, 2)
+                if idx in chosen:
+                    cv2.putText(overlays, chr(ord('A')+idx), (x, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            # scoring
+            total += 1
+            key = version_key.get(str(qno))
+            if key is None:
+                # no key for question; leave unscored (or treat as zero)
+                pass
+            else:
+                if isinstance(chosen_opt, list):
+                    # multiple marks -> 0 and flag
+                    flagged.append({"q": qno, "reason": "multiple_marks", "chosen": chosen_opt})
+                elif chosen_opt is None:
+                    # unanswered; optionally penalize
+                    pass
+                else:
+                    if chosen_opt == key:
+                        correct += 1
+            qno += 1
+    score = {"total_questions": total, "correct": correct, "score_percent": round(correct/total*100 if total>0 else 0,2)}
+    # convert overlays to bytes (PNG)
+    _, png = cv2.imencode('.png', overlays)
+    overlay_bytes = png.tobytes()
+    return {
+        "answers": answers,
+        "score": score,
+        "flagged": flagged,
+        "overlay_png_bytes": overlay_bytes
+    }
+
+def evaluate_bytes_and_rectify(file_bytes: bytes, answer_key: Dict[str,str], grid_spec: Dict[str,int]) -> Dict[str,Any]:
+    img = read_image_bytes(file_bytes)
+    img = gray_resize(img, max_dim=1400)
+    warped, _ = find_sheet_corners(img)
+    result = evaluate_sheet(warped, answer_key, grid_spec)
+    return result
+3) models.py (SQLAlchemy)
+Copy code
+Python
+# models.py
+from sqlalchemy import Column, Integer, String, LargeBinary, DateTime, JSON, Text
+from sqlalchemy.ext.declarative import declarative_base
+from datetime import datetime
+import json
+
+Base = declarative_base()
+
+class SheetResult(Base):
+    _tablename_ = "sheet_results"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(String, nullable=True)       # optional
+    filename = Column(String)
+    version = Column(String, nullable=True)
+    raw_image = Column(LargeBinary)                  # store original bytes
+    rectified_image = Column(LargeBinary, nullable=True)  # optional
+    overlay_image = Column(LargeBinary, nullable=True)
+    result_json = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+4) db.py
+Copy code
+Python
+# db.py
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from models import Base
+import os
+
+DB_URL = os.environ.get("OMR_DB_URL", "sqlite:///./omr_results.db")
+engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
+5) app.py — FastAPI backend
+Copy code
+Python
+# app.py
+import uvicorn
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from db import SessionLocal, init_db
+from models import SheetResult
+from omr_processing import evaluate_bytes_and_rectify, read_image_bytes
+import json
+import io
+import csv
+import base64
+from datetime import datetime
+import os
+
+app = FastAPI(title="OMR Evaluation API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+init_db()
+
+# load example answer keys (or you can load from filesystem)
+ANSWER_KEYS_DIR = os.environ.get("ANSWERS_DIR", "./answer_keys")
+
+def load_answer_key(version: str):
+    path = os.path.join(ANSWER_KEYS_DIR, f"{version}.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Answer key for version '{version}' not found at {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+@app.post("/upload")
+async def upload_sheet(file: UploadFile = File(...), version: str = Form(...), student_id: str = Form(None)):
+    content = await file.read()
+    try:
+        answer_key = load_answer_key(version)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # grid_spec must be provided via answer key or default
+    grid_spec = answer_key.get("_grid_spec", {"rows":20, "cols_per_row":5, "options":4})
+    ak = answer_key.get("answers", {})
+    result = evaluate_bytes_and_rectify(content, ak, grid_spec)
+    db = SessionLocal()
+    try:
+        record = SheetResult(
+            student_id=student_id,
+            filename=file.filename,
+            version=version,
+            raw_image=content,
+            rectified_image=None,
+            overlay_image=result.get("overlay_png_bytes"),
+            result_json=result.get("score")  # you can save full answers as well
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+    finally:
+        db.close()
+    return JSONResponse({
+        "id": record.id,
+        "filename": record.filename,
+        "score": result.get("score"),
+        "flagged": result.get("flagged"),
+        "answers_found": len(result.get("answers", {}))
+    })
+
+@app.get("/results/{item_id}")
+def get_result(item_id: int):
+    db = SessionLocal()
+    rec = db.query(SheetResult).get(item_id)
+    db.close()
+    if not rec:
+        raise HTTPException(status_code=404, detail="Result not found")
+    # return JSON with base64 overlay for convenience
+    overlay_b64 = None
+    if rec.overlay_image:
+        overlay_b64 = base64.b64encode(rec.overlay_image).decode("utf-8")
+    return {
+        "id": rec.id,
+        "student_id": rec.student_id,
+        "filename": rec.filename,
+        "version": rec.version,
+        "created_at": rec.created_at.isoformat(),
+        "score": rec.result_json,
+        "overlay_base64": overlay_b64
+    }
+
+@app.get("/export/csv")
+def export_csv():
+    db = SessionLocal()
+    records = db.query(SheetResult).all()
+    db.close()
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["id", "student_id", "filename", "version", "created_at", "score_correct", "score_total", "score_percent"])
+    for r in records:
+        sc = r.result_json or {}
+        writer.writerow([r.id, r.student_id, r.filename, r.version, r.created_at.isoformat(), sc.get("correct"), sc.get("total_questions"), sc.get("score_percent")])
+    out.seek(0)
+    return StreamingResponse(io.BytesIO(out.getvalue().encode("utf-8")), media_type="text/csv", headers={"Content-Disposition":"attachment; filename=omr_results.csv"})
+
+if _name_ == "_main_":
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+6) streamlit_app.py — evaluator UI (Streamlit)
+Copy code
+Python
+# streamlit_app.py
+import streamlit as st
+import requests
+from PIL import Image
+import io
+import base64
+import os
+
+API_URL = os.environ.get("OMR_API_URL", "http://localhost:8000")
+
+st.title("OMR Evaluator — Streamlit MVP")
+
+st.markdown("Upload OMR sheet image and choose sheet version.")
+
+uploaded = st.file_uploader("Choose OMR image (jpg/png/pdf)", type=["jpg","jpeg","png","pdf"])
+version = st.text_input("Sheet version (file in answer_keys, e.g., sample_answer_key)", "sample_answer_key")
+student_id = st.text_input("Student ID (optional)")
+
+if st.button("Upload & Evaluate") and uploaded is not None:
+    files = {"file": (uploaded.name, uploaded.getvalue(), uploaded.type)}
+    data = {"version": version, "student_id": student_id}
+    with st.spinner("Uploading..."):
+        resp = requests.post(f"{API_URL}/upload", files=files, data=data)
+    if resp.status_code == 200:
+        j = resp.json()
+        st.success(f"Processed — id: {j['id']}")
+        # fetch result
+        r = requests.get(f"{API_URL}/results/{j['id']}")
+        if r.status_code == 200:
+            res = r.json()
+            st.write("Score:", res["score"])
+            if res.get("overlay_base64"):
+                b = base64.b64decode(res["overlay_base64"])
+                img = Image.open(io.BytesIO(b))
+                st.image(img, caption="Overlay (detected filled bubbles)", use_column_width=True)
+    else:
+        st.error(f"Upload failed: {resp.text}")
+
+if st.button("Export CSV"):
+    url = f"{API_URL}/export/csv"
+    r = requests.get(url)
+    if r.status_code == 200:
+        st.download_button("Download CSV", r.content, file_name="omr_results.csv", mime="text/csv")
+    else:
+        st.error("Failed to export CSV")
+7) answer_keys/sample_answer_key.json (example)
+Copy code
+Json
+{
+  "_grid_spec": {
+    "rows": 20,
+    "cols_per_row": 5,
+    "options": 4
+  },
+  "answers": {
+    "1": "A",
+    "2": "C",
+    "3": "B",
+    "4": "D",
+    "5": "A",
+    "6": "B",
+    "7": "D",
+    "8": "C",
+    "9": "A",
+    "10": "B",
+    "11": "D",
+    "12": "C",
+    "13": "A",
+    "14": "B",
+    "15": "D",
+    "16": "C",
+    "17": "A",
+    "18": "B",
+    "19": "D",
+    "20": "C"
+  }
+}
